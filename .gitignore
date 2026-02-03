@@ -1,0 +1,26 @@
+# 忽略权重文件
+*.pth
+*.bin
+*.safetensors
+*.pt
+ckpt/
+checkpoint/
+
+# 忽略数据集和多媒体文件
+videomme/
+data/
+*.mp4
+*.jpg
+*.png
+
+# 忽略 Python 缓存和安装包
+__pycache__/
+*.pyc
+build/
+dist/
+*.egg-info/
+
+# 忽略日志和系统文件
+logs/
+.DS_Store
+*.log
