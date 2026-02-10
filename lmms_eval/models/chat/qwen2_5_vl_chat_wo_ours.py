@@ -20,7 +20,7 @@ from lmms_eval.metadata_manager import metadata_manager
 try:
     from qwen_vl_utils import process_vision_info
 except ImportError:
-    eval_logger.warning("Failed to import qwen_vl_utils; Please install it via `pip install qwen-vl-utils`")
+    eval_logger.warning("Failed to import qwen_vl_utils; Please install it via pip install qwen-vl-utils")
 
 TEST_MIN_TOKEN_MAX_COVERAGE = False
 USE_AKS = False
@@ -44,20 +44,29 @@ def cdpruner_dpp_dynamic_resolution(
     total_token_budget,
     min_token_per_frame=512,
     max_token_per_frame=4096,
-    alpha=1.0 
+    target_token_per_frame=512
 ):  
     device = frame_features.device
     eps = 1e-6
     T = frame_features.shape[0]
     print(min_token_per_frame)
+
+
     if T <= 1:
         final_indices = torch.tensor([0], device=device)
         actual_res = min(total_token_budget, max_token_per_frame)
         selected_token_counts = torch.tensor([actual_res], device=device).int()
         return final_indices, selected_token_counts
+
+    if TEST_MIN_TOKEN_MAX_COVERAGE:
+        K_max = total_token_budget // target_token_per_frame
+        indices = np.linspace(0, T - 1, K_max, dtype=int)
+        indices = np.unique(indices)
+        final_indices = torch.tensor(indices, device=device)
+        selected_token_counts = torch.full((len(final_indices),), target_token_per_frame, device=device).int()
+        return final_indices, selected_token_counts
     
     K_max = total_token_budget // min_token_per_frame
-
     R = max(2.0, float(T) / (K_max + eps))
 
     # ---------- 2. 构建特征相似度矩阵 ----------
@@ -68,10 +77,7 @@ def cdpruner_dpp_dynamic_resolution(
     frame_indices = torch.arange(T, device=device)
     dist_sq = (frame_indices[:, None] - frame_indices[None, :]).float() ** 2
     location_prior = torch.exp(-dist_sq / (R ** 2))
-    #print(content_sim)
-
     similarity = 0.8 * content_sim + 0.2 * location_prior
-    #print(similarity)
 
     # ---------- 4. 计算并平滑文本相关性 (Relevance) ----------
     img = frame_embeds / (frame_embeds.norm(dim=-1, keepdim=True) + eps)
@@ -116,17 +122,7 @@ def cdpruner_dpp_dynamic_resolution(
     selected_importance = relevance[selected_indices]
     selected_indices = torch.tensor(selected_indices, device=device)
     selected_energies = torch.tensor(selected_importance, device=device)
-    #print(selected_energies)
     
-    if TEST_MIN_TOKEN_MAX_COVERAGE:
-        indices = np.linspace(0, T - 1, K_max, dtype=int)
-        indices = np.unique(indices)
-        final_indices = torch.tensor(indices, device=device)
-        selected_token_counts = torch.full((len(final_indices),), min_token_per_frame, device=device).int()
-        
-        return final_indices, selected_token_counts
-
-
     final_indices, selected_token_counts = dynamic_token_allocation_v2(
         importance=selected_energies,
         total_token_budget=total_token_budget,
@@ -253,7 +249,7 @@ def load_and_resize_images(frame_paths, resolutions, patch_size=14):
 
 
 
-def aks(scores, frame_paths, max_num_frames=8, target_token_per_frame=512, t1=0.8, all_depth=5, t2=-100):
+def aks(scores, frame_paths, max_num_frames=8, target_token_per_frame=512, t1=0.8, all_depth=3, t2=-100):
     """
     自适应选帧并返回统一分辨率的帧路径列表（使用 meanstd 递归逻辑）
 
@@ -329,7 +325,7 @@ def aks(scores, frame_paths, max_num_frames=8, target_token_per_frame=512, t1=0.
         
 
   
-    print("here",len(final_paths))
+    print(len(final_paths))
     processed_images = []
     for p in final_paths:
         img = Image.open(p).convert("RGB")
@@ -568,10 +564,10 @@ function variables
                         frame_features=full_feats,
                         frame_embeds=full_feats,
                         text_embed=text_embed,
-                        total_token_budget=self.max_num_frames * 512,
+                        total_token_budget=self.max_num_frames * target_token_per_frame,
                         min_token_per_frame=512,
                         max_token_per_frame=512,
-                        alpha=1.0
+                        target_token_per_frame=512
                     )
                     selected_indices = selected_idx.tolist()
                     sorted_pairs = sorted(zip(selected_indices, selected_resolution.tolist()), key=lambda x: x[0])
@@ -630,7 +626,7 @@ function variables
 
             image_grid_thw = inputs['image_grid_thw']
 
-            #print("--- 每个视觉单元的 Token 分布 ---")
+
             for i, (t, h, w) in enumerate(image_grid_thw):
                 num_tokens = int(h * w)
                 #print(f"视觉单元 {i}: 时间维(T)={t}, 高度(H)={h}, 宽度(W)={w}, Token总数={num_tokens}")
