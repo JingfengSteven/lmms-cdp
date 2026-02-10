@@ -5,7 +5,7 @@ import numpy as np
 from loguru import logger as eval_logger
 from PIL import Image
 from tqdm import tqdm
-
+import heapq
 from lmms_eval import utils
 from lmms_eval.api.instance import Instance
 from lmms_eval.api.registry import register_model
@@ -22,13 +22,13 @@ try:
 except ImportError:
     eval_logger.warning("Failed to import qwen_vl_utils; Please install it via `pip install qwen-vl-utils`")
 
-TEST_MIN_TOKEN_MAX_COVERAGE = True
+TEST_MIN_TOKEN_MAX_COVERAGE = False
+USE_AKS = False
+USE_Q_FRAME = True
 
-## ===============================================================================
 import torch
 import numpy as np
 from sentence_transformers import SentenceTransformer, util
-# from modelscope import Qwen2_5_VLForConditionalGeneration, AutoProcessor
 from qwen_vl_utils import process_vision_info
 import os
 import json
@@ -49,12 +49,15 @@ def cdpruner_dpp_dynamic_resolution(
     device = frame_features.device
     eps = 1e-6
     T = frame_features.shape[0]
-    min_token_per_frame=max_token_per_frame//8
+    print(min_token_per_frame)
+    if T <= 1:
+        final_indices = torch.tensor([0], device=device)
+        actual_res = min(total_token_budget, max_token_per_frame)
+        selected_token_counts = torch.tensor([actual_res], device=device).int()
+        return final_indices, selected_token_counts
     
     K_max = total_token_budget // min_token_per_frame
 
-    # ---------- 1. 自动计算局部抑制半径 R ----------
-    # R 决定了选出一帧后，其周围多大范围会被抑制。设为预期采样间隔。
     R = max(2.0, float(T) / (K_max + eps))
 
     # ---------- 2. 构建特征相似度矩阵 ----------
@@ -65,26 +68,22 @@ def cdpruner_dpp_dynamic_resolution(
     frame_indices = torch.arange(T, device=device)
     dist_sq = (frame_indices[:, None] - frame_indices[None, :]).float() ** 2
     location_prior = torch.exp(-dist_sq / (R ** 2))
+    #print(content_sim)
 
-    # 融合相似度：保证矩阵不是稀疏的，且具有局部排他性
-    # 0.7 和 0.3 是平衡点，既看内容也看位置
-    similarity = content_sim #+ 0.2 * location_prior
+    similarity = 0.8 * content_sim + 0.2 * location_prior
+    #print(similarity)
 
     # ---------- 4. 计算并平滑文本相关性 (Relevance) ----------
     img = frame_embeds / (frame_embeds.norm(dim=-1, keepdim=True) + eps)
     txt = text_embed / (text_embed.norm() + eps)
     relevance = (img @ txt).squeeze()
-    
-    # 优雅的平滑逻辑：
-    # 1. 使用 Sigmoid 将原始得分映射到 (0, 1)
-    # 2. 缩放到 (0.5, 1.0)，消除“能量断层”
-    # 这样相关性最高和最低的帧，能量差距最多只有 2-4 倍，而不是成百上千倍
-    gamma = 0.5 
-    kernel = torch.pow(relevance[:, None], gamma) * similarity * torch.pow(relevance[None, :], gamma)
+    rel_min = relevance.min()
+    rel_max = relevance.max()
+    relevance = (relevance - rel_min) / (rel_max - rel_min + eps)
+    kernel = relevance[:, None] * similarity * relevance[None, :]
 
     
 
-    # ---------- 6. Greedy DPP 选帧 (Gram-Schmidt) ----------
     cis = torch.zeros((K_max, T), device=device)
     di2s = torch.diag(kernel).clone()
     selected_indices = []
@@ -94,19 +93,15 @@ def cdpruner_dpp_dynamic_resolution(
         j = torch.argmax(di2s)
         current_energy = di2s[j]
         
-        # 能量过低则停止
         if current_energy <= 1e-7:
             break
             
         selected_indices.append(j.item())
         
-        # 【关键优化】能量对数平滑：
-        # 用于 Token 分配的“重要性”不应直接使用物理能量，
-        # 取对数能让 Token 分配更平均，避免一帧独占所有预算。
-        importance_score = torch.log1p(current_energy) 
+     
+        importance_score = current_energy 
         selected_energies.append(importance_score.item())
         
-        # 标准 Gram-Schmidt 更新
         if i == 0:
             eis = kernel[j] / torch.sqrt(current_energy + eps)
         else:
@@ -117,29 +112,21 @@ def cdpruner_dpp_dynamic_resolution(
         di2s = di2s - eis ** 2
         di2s = torch.clamp(di2s, min=0)
         di2s[j] = -float("inf") 
-
-    # 转化为 Tensor
+    
+    selected_importance = relevance[selected_indices]
     selected_indices = torch.tensor(selected_indices, device=device)
-    selected_energies = torch.tensor(selected_energies, device=device)
-
-    # ---------- 7. 动态 Token 分配 ----------
-    # 如果处于强制覆盖模式
-    '''if 'TEST_MIN_TOKEN_MAX_COVERAGE' in globals() and TEST_MIN_TOKEN_MAX_COVERAGE:
-        final_indices = selected_indices
-        selected_token_counts = torch.full_like(selected_energies, min_token_per_frame).int()
-        return final_indices, selected_token_counts'''
+    selected_energies = torch.tensor(selected_importance, device=device)
+    #print(selected_energies)
+    
     if TEST_MIN_TOKEN_MAX_COVERAGE:
-        # 按照 K_max 进行均匀采样
         indices = np.linspace(0, T - 1, K_max, dtype=int)
         indices = np.unique(indices)
-        
         final_indices = torch.tensor(indices, device=device)
-        # 每一帧分配相等的最小 token 预算
         selected_token_counts = torch.full((len(final_indices),), min_token_per_frame, device=device).int()
         
         return final_indices, selected_token_counts
 
-    # 调用分配函数
+
     final_indices, selected_token_counts = dynamic_token_allocation_v2(
         importance=selected_energies,
         total_token_budget=total_token_budget,
@@ -160,7 +147,6 @@ def dynamic_token_allocation_v2(
     device = importance.device
     n_frames = len(importance)
     
-    # 记录原始候选人的完整状态
     active_mask = torch.ones(n_frames, dtype=torch.bool, device=device)
     fixed_mask = torch.zeros(n_frames, dtype=torch.bool, device=device)
     allocations = torch.zeros(n_frames, device=device)
@@ -196,11 +182,7 @@ def dynamic_token_allocation_v2(
             allocations[to_assign_mask] = current_allocs
             break
 
-    # --- 第二阶段：救回（核心修改点！） ---
-    # 此时，所有 active 的帧都已经 >= min 且 <= max
-    # 如果此时还有钱（diff 很大），且还有被踢掉的帧，我们尝试“捞人”
-    
-    # 找到所有被踢掉的帧，按重要性排序
+
     evicted_mask = ~active_mask
     if evicted_mask.any():
         evicted_indices = torch.where(evicted_mask)[0]
@@ -242,8 +224,6 @@ def estimate_hw_from_resolution(orig_h, orig_w, target_token_count, patch_size=1
     aspect_ratio = orig_h / orig_w
     grid_w = max(1, int(round((target_token_count / aspect_ratio) ** 0.5)))
     grid_h = max(1, int(round(grid_w * aspect_ratio)))
-    
-
     new_h = grid_h * patch_size
     new_w = grid_w * patch_size
     return new_h, new_w
@@ -271,8 +251,132 @@ def load_and_resize_images(frame_paths, resolutions, patch_size=14):
 
     return images, metadata
 
-## ===============================================================================
 
+
+def aks(scores, frame_paths, max_num_frames=8, target_token_per_frame=512, t1=0.8, all_depth=5, t2=-100):
+    """
+    自适应选帧并返回统一分辨率的帧路径列表（使用 meanstd 递归逻辑）
+
+    Args:
+        scores (List[float]): 每一帧的分数
+        frame_paths (List[str]): 对应的帧路径
+        max_num_frames (int): 最多选多少帧
+        target_token_per_frame (int): 保留接口一致性，不使用
+        t1 (float): top-mean 与整体均值差异阈值
+        all_depth (int): 最大递归层数
+        t2 (float): 标准差阈值，默认 -100 表示无效
+
+    Returns:
+        List[str]: 最终选中的帧路径，按时间顺序排列
+    """
+    def meanstd(len_scores, dic_scores, n, fns, t1, t2, all_depth):
+        split_scores = []
+        split_fn = []
+        no_split_scores = []
+        no_split_fn = []
+        for dic_score, fn in zip(dic_scores, fns):
+            score = dic_score['score']
+            depth = dic_score['depth']
+            mean = np.mean(score)
+            std = np.std(score)
+            top_n = heapq.nlargest(n, range(len(score)), score.__getitem__)
+            top_score = [score[t] for t in top_n]
+            mean_diff = np.mean(top_score) - mean
+            if mean_diff > t1 and std > t2:
+                no_split_scores.append(dic_score)
+                no_split_fn.append(fn)
+            elif depth < all_depth:
+                mid = len(score) // 2
+                score1 = score[:mid]
+                score2 = score[mid:]
+                fn1 = fn[:mid]
+                fn2 = fn[mid:]
+                split_scores.append(dict(score=score1, depth=depth+1))
+                split_scores.append(dict(score=score2, depth=depth+1))
+                split_fn.append(fn1)
+                split_fn.append(fn2)
+            else:
+                no_split_scores.append(dic_score)
+                no_split_fn.append(fn)
+
+        if len(split_scores) > 0:
+            all_split_score, all_split_fn = meanstd(len_scores, split_scores, n, split_fn, t1, t2, all_depth)
+        else:
+            all_split_score = []
+            all_split_fn = []
+        all_split_score = no_split_scores + all_split_score
+        all_split_fn = no_split_fn + all_split_fn
+        return all_split_score, all_split_fn
+
+    scores = np.array(scores)
+    if scores.max() != scores.min():
+        norm_scores = (scores - scores.min()) / (scores.max() - scores.min())
+    else:
+        norm_scores = scores
+
+    dic_score = dict(score=norm_scores.tolist(), depth=0)
+    segments_info, segments_paths = meanstd(len(norm_scores), [dic_score], max_num_frames, [frame_paths], t1, t2, all_depth)
+
+    selected_paths_with_time = []
+    for info, paths in zip(segments_info, segments_paths):
+        f_num = max(1, int(max_num_frames / (2 ** info['depth'])))
+        actual_k = min(len(info['score']), f_num)
+        topk_idx = heapq.nlargest(actual_k, range(len(info['score'])), info['score'].__getitem__)
+        for idx in topk_idx:
+            selected_paths_with_time.append(paths[idx])
+
+    final_paths = sorted(list(set(selected_paths_with_time)))
+        
+
+  
+    print("here",len(final_paths))
+    processed_images = []
+    for p in final_paths:
+        img = Image.open(p).convert("RGB")
+        orig_w, orig_h = img.size
+        new_h, new_w = estimate_hw_from_resolution(orig_h, orig_w, target_token_per_frame)
+        img_resized = img.resize((new_w, new_h), resample=Image.BICUBIC)
+        processed_images.append(img_resized)
+        
+    return processed_images
+
+
+def q_frames(
+    full_feats: torch.Tensor, 
+    text_embed: torch.Tensor, 
+    tau: float = 1.0
+):
+    """
+    TextImageMatching 多尺度组合采样:
+    - Top 4 帧: 512 tokens (高分辨率)
+    - 次 Top 8 帧: 128 tokens (中分辨率)
+    - 再 Top 32 帧: 32 tokens (低分辨率)
+    """
+    scores = (full_feats @ text_embed).float()
+    probs = (scores / tau).softmax(dim=-1)
+    gumbel_noise = -torch.log(-torch.log(torch.rand_like(probs) + 1e-10) + 1e-10)
+    perturbed_scores = torch.log(probs + 1e-10) + gumbel_noise
+    
+    total_needed = 4 + 8 + 32
+    if len(scores) < total_needed:
+        top_k_indices = torch.topk(perturbed_scores, k=len(scores)).indices.tolist()
+    else:
+        top_k_indices = torch.topk(perturbed_scores, k=total_needed).indices.tolist()
+
+    index_to_token = {}
+    
+    for i, idx in enumerate(top_k_indices):
+        if i < 4:
+            index_to_token[idx] = 512
+        elif i < 4 + 8:
+            index_to_token[idx] = 128
+        else:
+            index_to_token[idx] = 32
+
+    sorted_indices = sorted(index_to_token.keys())
+    sorted_token_counts = [index_to_token[idx] for idx in sorted_indices]
+    
+    return sorted_indices, sorted_token_counts
 
 @register_model("qwen2_5_vl_chat_wo_ours")
 class Qwen2_5_VL_Chat_WO_Ours(Qwen2_5_VLSimple):
@@ -308,10 +412,8 @@ class Qwen2_5_VL_Chat_WO_Ours(Qwen2_5_VLSimple):
         e2e_latency = 0
         total_tokens = 0
         for chunk in chunks:
-            # Handle both single-item and multi-item chunks
-            # Always convert to list for consistent handling
+           
             if len(chunk) == 1:
-                # Single item in chunk
                 ctx = [chunk[0][0]]
                 doc_to_messages = [chunk[0][1]]
                 all_gen_kwargs = [chunk[0][2]]
@@ -319,7 +421,7 @@ class Qwen2_5_VL_Chat_WO_Ours(Qwen2_5_VLSimple):
                 task = [chunk[0][4]]
                 split = [chunk[0][5]]
             else:
-                # Multiple items in chunk - unzip and convert to list
+                
                 ctx, doc_to_messages, all_gen_kwargs, doc_id, task, split = zip(*chunk)
                 ctx = list(ctx)
                 doc_to_messages = list(doc_to_messages)
@@ -382,6 +484,12 @@ function variables
                         question = text.split("\nA.")[0]
                         original_questions.append(question)
                         
+            print("###" * 30)
+            
+            print(original_questions)
+            
+            print("###" * 30)
+            
             full_feats_list = []
             text_embed_list = []
             with torch.no_grad():
@@ -430,36 +538,55 @@ function variables
             # Collect all frame metadata for this doc_id
             all_frame_metadata = []
 
-            # TODO: 执行dpp选帧和动态分配token
+            
             for full_feats, text_embed, video_frame_path, physical_patch_limit in zip(full_feats_list, text_embed_list, video_frame_paths, physical_patch_limits):
-                selected_idx, selected_resolution = cdpruner_dpp_dynamic_resolution(
-                    frame_features=full_feats,
-                    frame_embeds=full_feats,
-                    text_embed=text_embed,
-                    total_token_budget=self.max_num_frames * physical_patch_limit,
-                    min_token_per_frame=256,
-                    max_token_per_frame=physical_patch_limit,
-                    alpha=1.0
-                )
-                selected_indices = selected_idx.tolist()
-                sorted_pairs = sorted(zip(selected_indices, selected_resolution.tolist()), key=lambda x: x[0])
-                selected_indices = [i for i, _ in sorted_pairs]
-                selected_resolution = [r for _, r in sorted_pairs]
-                selected_frames = [video_frame_path[i] for i in selected_indices]
-                selected_images, frame_metadata = load_and_resize_images(selected_frames, selected_resolution)
-                final_daynamic_video_frame_paths.append(selected_images)
+                if USE_AKS==True:
+                    with torch.no_grad():
+                        raw_scores = (full_feats @ text_embed).cpu().numpy()
+                    selected_images = aks(
+                        scores=raw_scores,
+                        frame_paths=video_frame_path,
+                        max_num_frames=self.max_num_frames,
+                        target_token_per_frame=512,
+                        t1=0.8
+                    )
+                
+                    final_daynamic_video_frame_paths.append(selected_images)
+                
+                elif USE_Q_FRAME==True:
+                 
+                    selected_indices, selected_resolution = q_frames(
+                        full_feats=full_feats,
+                        text_embed=text_embed,
+                        tau=1.0
+                    )
+                    selected_frames = [video_frame_path[i] for i in selected_indices]
+                    selected_images, _ = load_and_resize_images(selected_frames, selected_resolution)
+                    final_daynamic_video_frame_paths.append(selected_images)
+                else:
+                    selected_idx, selected_resolution = cdpruner_dpp_dynamic_resolution(
+                        frame_features=full_feats,
+                        frame_embeds=full_feats,
+                        text_embed=text_embed,
+                        total_token_budget=self.max_num_frames * 512,
+                        min_token_per_frame=512,
+                        max_token_per_frame=512,
+                        alpha=1.0
+                    )
+                    selected_indices = selected_idx.tolist()
+                    sorted_pairs = sorted(zip(selected_indices, selected_resolution.tolist()), key=lambda x: x[0])
+                    selected_indices = [i for i, _ in sorted_pairs]
+                    selected_resolution = [r for _, r in sorted_pairs]
+                    selected_frames = [video_frame_path[i] for i in selected_indices]
+                    selected_images, frame_metadata = load_and_resize_images(selected_frames, selected_resolution)
+                    final_daynamic_video_frame_paths.append(selected_images)
               
-
-        
         
             new_batched_messages = []
             for msg_idx, msg in enumerate(batched_messages):
                 
                 content = []
-                for frame_path, token_cnt in zip(
-                        final_daynamic_video_frame_paths[msg_idx],
-                        selected_resolution
-                    ):
+                for frame_path in final_daynamic_video_frame_paths[msg_idx]:
                     content.append({
                         "type": "image",
                         "image": frame_path,         
@@ -479,16 +606,15 @@ function variables
             
             if video_inputs is not None:
                 total_frames = video_inputs[0].shape[0]
-                # Only resample if we have more frames than needed
+            
                 if total_frames > self.max_num_frames:
                     indices = np.linspace(0, total_frames - 1, self.max_num_frames, dtype=int)
-                    # Append the last frame index if not already included
                     if total_frames - 1 not in indices:
                         indices = np.append(indices, total_frames - 1)
-                    indices = np.unique(indices)  # Ensure uniqueness
+                    indices = np.unique(indices)  
                     video_inputs[0] = video_inputs[0][indices]
             else:
-                # TODO: 处理多图的逻辑
+                 
                 pass
                 
             padding_side = "left" if self.batch_size > 1 else "right"
@@ -525,7 +651,7 @@ function variables
                 "top_p": None,
                 "num_beams": 1,
             }
-            # Update with provided kwargs
+
             current_gen_kwargs = {**default_gen_kwargs, **gen_kwargs}
             pad_token_id = self.tokenizer.pad_token_id
 
